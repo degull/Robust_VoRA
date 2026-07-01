@@ -17,6 +17,7 @@ ENV/
 # Local datasets and generated artifacts
 data/
 outputs/
+third_party/Restormer/
 checkpoints/
 runs/
 wandb/
