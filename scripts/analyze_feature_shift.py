@@ -62,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-image", default=None)
     parser.add_argument("--visual-auto-select", action="store_true")
     parser.add_argument("--visual-candidates", type=int, default=40)
+    parser.add_argument("--visual-perturbation", default="snow", choices=PERTURBATIONS)
+    parser.add_argument("--visual-layer", default="model.encoder_level1", choices=FEATURE_LAYERS)
+    parser.add_argument("--visual-severity", type=float, default=0.9)
+    parser.add_argument("--feature-upsample", type=int, default=4)
     return parser.parse_args()
 
 
@@ -158,11 +162,16 @@ def main() -> None:
     save_bar_plot(rows, output_dir / "feature_shift_ratio.png")
     save_table_plot(rows, output_dir / "feature_shift_table.png")
     save_sample_grid(sample_batches, output_dir / "restoration_comparison_grid.png")
+    if visual_clean is not None:
+        save_feature_visualization(args, visual_clean, frozen_model, vora_model, device, output_dir)
     print()
     print(f"saved metrics: {output_dir / 'feature_shift_metrics.csv'}")
     print(f"saved plot: {output_dir / 'feature_shift_ratio.png'}")
     print(f"saved table: {output_dir / 'feature_shift_table.png'}")
     print(f"saved images: {output_dir / 'restoration_comparison_grid.png'}")
+    if visual_clean is not None:
+        print(f"saved feature map: {output_dir / 'vora_feature_map_comparison.png'}")
+        print(f"saved feature diff: {output_dir / 'vora_feature_diff_comparison.png'}")
 
 
 def build_loader(args: argparse.Namespace, perturbation: str) -> DataLoader:
@@ -231,6 +240,52 @@ def build_visual_sample(args, perturbation: str, clean: torch.Tensor, frozen_mod
     }
 
 
+def save_feature_visualization(args, clean: torch.Tensor, frozen_model, vora_model, device, output_dir: Path) -> None:
+    import random
+
+    from robust_vora.data.synthetic_perturbation_dataset import apply_perturbation
+
+    clean_device = clean.to(device)
+    degraded = apply_perturbation(
+        clean_device[0],
+        args.visual_perturbation,
+        severity=args.visual_severity,
+        rng=random.Random(args.seed),
+    ).unsqueeze(0)
+    with torch.no_grad():
+        clean_features, _ = extract_features(frozen_model, clean_device, (args.visual_layer,))
+        degraded_features, _ = extract_features(frozen_model, degraded, (args.visual_layer,))
+        vora_features, _ = extract_features(vora_model, degraded, (args.visual_layer,))
+
+    clean_map = feature_heatmap(clean_features[args.visual_layer], args.feature_upsample)
+    degraded_map = feature_heatmap(degraded_features[args.visual_layer], args.feature_upsample)
+    vora_map = feature_heatmap(vora_features[args.visual_layer], args.feature_upsample)
+    diff_degraded_raw = feature_diff_map(degraded_features[args.visual_layer], clean_features[args.visual_layer])
+    diff_vora_raw = feature_diff_map(vora_features[args.visual_layer], clean_features[args.visual_layer])
+    diff_degraded, diff_vora = colorize_shared_diff_maps(
+        [diff_degraded_raw, diff_vora_raw],
+        args.feature_upsample,
+    )
+
+    feature_path = output_dir / "vora_feature_map_comparison_unlabeled.png"
+    save_image(torch.stack([clean_map, degraded_map, vora_map], dim=0), feature_path, nrow=3, padding=12)
+    add_labels(
+        feature_path,
+        output_dir / "vora_feature_map_comparison.png",
+        ["clean F(x)", "frozen F(y)", "VoRA F(y)"],
+    )
+    feature_path.unlink(missing_ok=True)
+
+    diff_path = output_dir / "vora_feature_diff_comparison_unlabeled.png"
+    save_image(torch.stack([diff_degraded, diff_vora], dim=0), diff_path, nrow=2, padding=12)
+    add_labels(
+        diff_path,
+        output_dir / "vora_feature_diff_comparison.png",
+        ["|frozen F(y)-F(x)|", "|VoRA F(y)-F(x)|"],
+    )
+    diff_path.unlink(missing_ok=True)
+
+
 def center_crop(image: torch.Tensor, size: int) -> torch.Tensor:
     _, height, width = image.shape
     crop = min(size, height, width)
@@ -292,6 +347,45 @@ def feature_distance(
         target_norm = F.normalize(target.flatten(2), dim=1)
         distances.append((source_norm - target_norm).square().mean(dim=(1, 2)).sqrt())
     return torch.stack(distances, dim=0).mean()
+
+
+def feature_heatmap(feature: torch.Tensor, upsample: int = 1) -> torch.Tensor:
+    heatmap = feature[0].abs().mean(dim=0, keepdim=True).detach().cpu()
+    heatmap = heatmap - heatmap.min()
+    heatmap = heatmap / heatmap.max().clamp_min(1e-8)
+    heatmap = colorize_heatmap(heatmap)
+    return upsample_image(heatmap, upsample)
+
+
+def feature_diff_map(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    source_map = F.normalize(source.flatten(2), dim=1).view_as(source)
+    target_map = F.normalize(target.flatten(2), dim=1).view_as(target)
+    diff = (source_map - target_map).abs()[0].mean(dim=0, keepdim=True).detach().cpu()
+    return diff
+
+
+def colorize_shared_diff_maps(diff_maps: list[torch.Tensor], upsample: int = 1) -> list[torch.Tensor]:
+    shared_min = min(diff.min() for diff in diff_maps)
+    shared_max = max(diff.max() for diff in diff_maps)
+    heatmaps = []
+    for diff in diff_maps:
+        normalized = (diff - shared_min) / (shared_max - shared_min).clamp_min(1e-8)
+        heatmaps.append(upsample_image(colorize_heatmap(normalized), upsample))
+    return heatmaps
+
+
+def colorize_heatmap(gray: torch.Tensor) -> torch.Tensor:
+    gray = gray.clamp(0.0, 1.0)
+    red = torch.clamp(1.5 * gray, 0.0, 1.0)
+    green = torch.clamp(1.5 - (gray - 0.35).abs() * 3.0, 0.0, 1.0)
+    blue = torch.clamp(1.5 * (1.0 - gray), 0.0, 1.0)
+    return torch.cat([red, green, blue], dim=0)
+
+
+def upsample_image(image: torch.Tensor, scale: int) -> torch.Tensor:
+    if scale <= 1:
+        return image
+    return F.interpolate(image.unsqueeze(0), scale_factor=scale, mode="nearest").squeeze(0)
 
 
 def average_row(perturbation: str, stats: dict[str, float], steps: int) -> dict[str, float | str]:
@@ -392,6 +486,18 @@ def add_grid_labels(input_path: Path, output_path: Path, sample_batches: list[di
     row_height = image.height // max(len(sample_batches), 1)
     for row, batch in enumerate(sample_batches):
         draw.text((8, label_height + row * row_height + 8), str(batch["perturbation"]), fill="black")
+    canvas.save(output_path)
+
+
+def add_labels(input_path: Path, output_path: Path, labels: list[str]) -> None:
+    image = Image.open(input_path).convert("RGB")
+    label_height = 28
+    canvas = Image.new("RGB", (image.width, image.height + label_height), "white")
+    canvas.paste(image, (0, label_height))
+    draw = ImageDraw.Draw(canvas)
+    cell_width = image.width // len(labels)
+    for column, label in enumerate(labels):
+        draw.text((column * cell_width + 8, 8), label, fill="black")
     canvas.save(output_path)
 
 

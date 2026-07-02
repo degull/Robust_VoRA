@@ -5,6 +5,7 @@ import csv
 from pathlib import Path
 
 import torch
+from torchvision.utils import save_image
 
 from robust_vora.data import build_synthetic_perturbation_loaders
 from robust_vora.models import (
@@ -40,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vora-scale", type=float, default=1.0)
     parser.add_argument("--lambda-feat", type=float, default=0.0)
     parser.add_argument("--log-interval", type=int, default=100)
+    parser.add_argument("--save-samples", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -158,6 +160,15 @@ def main() -> None:
                 f"           train rec {train_metrics['rec_loss']:.4f} "
                 f"feat {train_metrics['feat_loss']:.4f}"
             )
+        if args.save_samples > 0:
+            save_validation_samples(
+                model,
+                valid_loader,
+                device,
+                output_dir / "samples",
+                epoch,
+                max_samples=args.save_samples,
+            )
         append_log_row(log_path, epoch, train_metrics, valid_metrics)
 
         checkpoint = {
@@ -197,6 +208,47 @@ def append_log_row(
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+@torch.no_grad()
+def save_validation_samples(
+    model: torch.nn.Module,
+    valid_loader,
+    device: torch.device,
+    output_dir: Path,
+    epoch: int,
+    max_samples: int = 4,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+    saved = 0
+    rows = []
+    for batch in valid_loader:
+        degraded = batch["degraded"].to(device, non_blocking=True)
+        clean = batch["clean"].to(device, non_blocking=True)
+        restored = model(degraded).clamp(0.0, 1.0)
+        batch_size = degraded.shape[0]
+        for index in range(batch_size):
+            rows.extend(
+                [
+                    degraded[index].detach().cpu(),
+                    restored[index].detach().cpu(),
+                    clean[index].detach().cpu(),
+                ]
+            )
+            saved += 1
+            if saved >= max_samples:
+                break
+        if saved >= max_samples:
+            break
+
+    if rows:
+        save_image(
+            torch.stack(rows, dim=0).clamp(0.0, 1.0),
+            output_dir / f"epoch_{epoch:03d}_degraded_restored_clean.png",
+            nrow=3,
+            padding=8,
+        )
 
 
 if __name__ == "__main__":
