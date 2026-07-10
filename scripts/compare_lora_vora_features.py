@@ -197,9 +197,13 @@ def save_visualization(args, frozen, lora, vora, device, output_dir: Path) -> No
     degraded_map = feature_heatmap(frozen_features[args.visual_layer], args.feature_upsample)
     lora_map = feature_heatmap(lora_features[args.visual_layer], args.feature_upsample)
     vora_map = feature_heatmap(vora_features[args.visual_layer], args.feature_upsample)
-    diff_degraded = feature_diff_heatmap(frozen_features[args.visual_layer], clean_features[args.visual_layer], args.feature_upsample)
-    diff_lora = feature_diff_heatmap(lora_features[args.visual_layer], clean_features[args.visual_layer], args.feature_upsample)
-    diff_vora = feature_diff_heatmap(vora_features[args.visual_layer], clean_features[args.visual_layer], args.feature_upsample)
+    diff_degraded_raw = feature_diff_map(frozen_features[args.visual_layer], clean_features[args.visual_layer])
+    diff_lora_raw = feature_diff_map(lora_features[args.visual_layer], clean_features[args.visual_layer])
+    diff_vora_raw = feature_diff_map(vora_features[args.visual_layer], clean_features[args.visual_layer])
+    diff_degraded, diff_lora, diff_vora = colorize_shared_diff_maps(
+        [diff_degraded_raw, diff_lora_raw, diff_vora_raw],
+        args.feature_upsample,
+    )
 
     feature_images = torch.stack([clean_map, degraded_map, lora_map, vora_map], dim=0)
     feature_path = output_dir / "feature_map_comparison_unlabeled.png"
@@ -329,14 +333,21 @@ def feature_heatmap(feature: torch.Tensor, upsample: int = 1) -> torch.Tensor:
     return upsample_image(heatmap, upsample)
 
 
-def feature_diff_heatmap(source: torch.Tensor, target: torch.Tensor, upsample: int = 1) -> torch.Tensor:
+def feature_diff_map(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     source_map = F.normalize(source.flatten(2), dim=1).view_as(source)
     target_map = F.normalize(target.flatten(2), dim=1).view_as(target)
     diff = (source_map - target_map).abs()[0].mean(dim=0, keepdim=True).detach().cpu()
-    diff = diff - diff.min()
-    diff = diff / diff.max().clamp_min(1e-8)
-    heatmap = colorize_heatmap(diff)
-    return upsample_image(heatmap, upsample)
+    return diff
+
+
+def colorize_shared_diff_maps(diff_maps: list[torch.Tensor], upsample: int = 1) -> list[torch.Tensor]:
+    shared_min = min(diff.min() for diff in diff_maps)
+    shared_max = max(diff.max() for diff in diff_maps)
+    heatmaps = []
+    for diff in diff_maps:
+        normalized = (diff - shared_min) / (shared_max - shared_min).clamp_min(1e-8)
+        heatmaps.append(upsample_image(colorize_heatmap(normalized), upsample))
+    return heatmaps
 
 
 def colorize_heatmap(gray: torch.Tensor) -> torch.Tensor:
